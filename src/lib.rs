@@ -38,6 +38,14 @@ impl std::error::Error for BackendError {
     }
 }
 
+/// Stores an epi/egui texture
+pub struct Image {
+    /// width, heigh
+    pub size: [usize; 2],
+    /// the pixels row by row, from top to bottom
+    pub pixels: Vec<egui::color::Color32>,
+    }
+
 /// Enum for selecting the right buffer type.
 #[derive(Debug)]
 enum BufferType {
@@ -93,7 +101,7 @@ pub struct RenderPass {
     texture_bind_group: Option<wgpu::BindGroup>,
     texture_version: Option<u64>,
     next_user_texture_id: u64,
-    pending_user_textures: Vec<(u64, egui::FontImage)>,
+    pending_user_textures: Vec<(u64, Image)>,
     /// Index is the same as in [`egui::TextureId::User`].
     user_textures: HashMap<u64, wgpu::BindGroup>,
 }
@@ -408,7 +416,7 @@ impl RenderPass {
     pub fn update_user_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let pending_user_textures = std::mem::take(&mut self.pending_user_textures);
         for (id, texture) in pending_user_textures {
-            let bind_group = self.egui_texture_to_wgpu(
+            let bind_group = self.egui_image_texture_to_wgpu(
                 device,
                 queue,
                 &texture,
@@ -416,6 +424,11 @@ impl RenderPass {
             );
             self.user_textures.insert(id, bind_group);
         }
+    }
+
+    /// Add a user texture
+    pub fn add_egui_user_texture(&mut self, id: u64, texture: Image) {
+        self.pending_user_textures.push((id, texture));
     }
 
     /// Assumes font_image contains srgb data.
@@ -487,6 +500,75 @@ impl RenderPass {
         bind_group
     }
 
+    fn egui_image_texture_to_wgpu(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: &Image,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        let size = wgpu::Extent3d {
+            width: image.size[0] as u32,
+            height: image.size[1] as u32,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(format!("{}_image", label).as_str()),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        });
+
+        let data: &[u8] = bytemuck::cast_slice(image.pixels.as_ref());
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: NonZeroU32::new(
+                    (image.pixels.len() / image.size[0]) as u32,
+                ),
+                rows_per_image: NonZeroU32::new(image.size[1] as u32),
+            },
+            size,
+        );
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(format!("{}_texture_sampler", label).as_str()),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(format!("{}_texture_bind_group", label).as_str()),
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        bind_group
+    }
     /// Registers a `wgpu::Texture` with a `egui::TextureId`.
     ///
     /// This enables the application to reference the texture inside an image ui element.
